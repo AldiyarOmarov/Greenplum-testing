@@ -1,0 +1,316 @@
+version: '3.8'
+
+volumes:
+  ingestion-volume-dags:
+
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.7.0}
+  environment:
+    &airflow-common-env
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 5
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+  volumes:
+    - type: bind
+      source: ${AIRFLOW_PROJ_DIR:-.}
+      target: /opt/airflow
+      bind:
+        propagation: rshared
+
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    s3fs_airflow_main:
+      condition: service_healthy
+
+services:
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    # volumes:
+    #  - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - internal_net
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8888:8080"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+    networks:
+      - internal_net
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+    networks:
+      - internal_net
+
+  airflow-worker:
+    <<: *airflow-common
+    command: worker
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+    networks:
+      - internal_net
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+    networks:
+      - internal_net
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    # Workaround for entrypoint issue. See: https://github.com/apache/airflow/issues/16252
+    command:
+      - bash
+      - -c
+      - airflow
+    networks:
+      - internal_net
+
+  flower:
+    <<: *airflow-common
+    command: flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+    networks:
+      - internal_net
+
+  greenplum:
+    build: ./greenplum
+    ports:
+      - 5433:5432
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=your_password /opt/greenplum-db-6/bin/psql -h greenplum -U gpadmin -d postgres -c \"SELECT extname FROM pg_extension;\"  | grep pxf"]
+      start_period: 40s
+      interval: 5s
+      timeout: 220s
+      retries: 50
+
+    environment: # Settings for PXF
+      - LANG=en_US.UTF-8
+      - LANGUAGE=en_US:en
+      - LC_ALL=en_US.UTF-8
+      #- JAVA_HOME=/home/gpadmin//.sdkman/candidates/java/current
+      # - GPHOME=/usr/local/gpdb
+      - GPHOME=/opt/greenplum-db-6
+      #- TZ=Europe/Moscow
+    networks:
+      - internal_net
+
+  minio:
+    # image: "quay.io/minio/minio:latest"
+    image: "minio/minio:latest"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    command: |
+      server /data --console-address ":9001"
+    ports:
+      - "9001:9001"
+      - "9000:9000" # Already exposed on internal_net
+    environment:
+      - MINIO_ROOT_USER=user_name
+      - MINIO_ROOT_PASSWORD=your_password
+      - MINIO_ACCESS_KEY=MXDKi8jYVe6ERlOp2KKY
+      - MINIO_SECRET_KEY=1MUC7ASgMmz2qPbjOmiuMgaxcLRXp8G1bPikgqrH
+    networks:
+      - internal_net
+
+  minio_createbuckets:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    #
+    # to delete backets use: /usr/bin/mc rm -r --force myminio/bookings;
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc config host add myminio http://minio:9000 user_name your_password;
+      /usr/bin/mc admin user add myminio MXDKi8jYVe6ERlOp2KKY 1MUC7ASgMmz2qPbjOmiuMgaxcLRXp8G1bPikgqrH ;
+      /usr/bin/mc admin policy attach myminio readwrite --user MXDKi8jYVe6ERlOp2KKY ;
+      /usr/bin/mc mb myminio/bookings;
+      /usr/bin/mc policy download myminio/bookings;
+      /usr/bin/mc mb myminio/airflow-main;
+      echo 'Airflow DAGs should be there'   | mc pipe myminio/airflow-main/dags/README.txt;
+      echo 'Airflow logs should be there'   | mc pipe myminio/airflow-main/logs/README.txt;
+      echo 'Airflow config should be there' | mc pipe myminio/airflow-main/config/README.txt;
+      echo 'Airflow plugins should be there'| mc pipe myminio/airflow-main/plugins/README.txt;
+      /usr/bin/mc mb myminio/airflow-omd;
+      echo 'OMD - Airflow DAGs should be there'   | mc pipe myminio/airflow-omd/s3_dags/README.txt;
+      exit 0;
+      "
+    networks:
+      - internal_net
+
+  nginx_flower:
+    image: "vzverev/nginx-basic-auth:v1.1"
+    ports:
+      - "9997:80"
+    depends_on:
+      - flower
+    environment:
+      - FORWARD_HOST=flower
+      - FORWARD_PORT=5555
+      - PROXY_PORT=9997
+      - BASIC_USERNAME=user_name
+      - BASIC_PASSWORD=your_password
+    networks:
+      - internal_net
+
+  s3fs_airflow_main:
+    image: "efrecon/s3fs:1.93"
+    # user: 1000:1000
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+        restart: true
+      minio_createbuckets:
+        condition: service_completed_successfully
+        restart: true
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    devices:
+      - /dev/fuse
+    volumes:
+      # - /etc/group:/etc/group:ro
+      # - /etc/passwd:/etc/passwd:ro
+      - type: bind
+        source: ./s3_mount_points/airflow-main
+        target: /opt/s3fs/bucket
+        bind:
+          propagation: rshared
+    command: ls.sh
+    environment:
+      - AWS_S3_URL=http://minio:9000
+      - AWS_S3_BUCKET=airflow-main
+      - AWS_S3_ACCESS_KEY_ID=MXDKi8jYVe6ERlOp2KKY
+      - AWS_S3_SECRET_ACCESS_KEY=1MUC7ASgMmz2qPbjOmiuMgaxcLRXp8G1bPikgqrH
+      - UID=1000
+      - GID=1000
+      - S3FS_DEBUG=1
+      - S3FS_ARGS="use_path_request_style,allow_other,nonempty"
+    networks:
+      - internal_net
+
+  s3fs_airflow_omd:
+    image: "efrecon/s3fs:1.93"
+    # user: 1000:1000
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+        restart: true
+      minio_createbuckets:
+        condition: service_completed_successfully
+        restart: true
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    devices:
+      - /dev/fuse
+    volumes:
+      # - /etc/group:/etc/group:ro
+      # - /etc/passwd:/etc/passwd:ro
+      - type: bind
+        source: ./s3_mount_points/airflow-omd
+        target: /opt/s3fs/bucket
+        bind:
+          propagation: rshared
+    command: ls.sh
+    environment:
+      - AWS_S3_URL=http://minio:9000
+      - AWS_S3_BUCKET=airflow-omd
+      - AWS_S3_ACCESS_KEY_ID=MXDKi8jYVe6ERlOp2KKY
+      - AWS_S3_SECRET_ACCESS_KEY=1MUC7ASgMmz2qPbjOmiuMgaxcLRXp8G1bPikgqrH
+      - UID=1000
+      - GID=1000
+      - S3FS_DEBUG=1
+      - S3FS_ARGS="use_path_request_style,allow_other,nonempty"
+    networks:
+      - internal_net
+
+
+  fix_sample_dags:
+    image: docker.getcollate.io/openmetadata/server:1.3.0
+    entrypoint: /bin/bash
+    environment:
+      UP_TUPLE: ${OMD_AIRFLOW_USERNAME:-admin}:${OMD_AIRFLOW_PASSWORD:-admin}
+    command:
+      - -c
+      - |
+        echo "Before fix:"
+        grep Authorization /opt/airflow/dags/airflow_lineage_operator.py
+        eval "UP_TUPLE_B64=\$(echo -n "$$UP_TUPLE" | base64)"
+        sed -i "s/YWRtaW46YWRtaW4=/$${UP_TUPLE_B64}/g" /opt/airflow/dags/airflow_lineage_operator.py
+        echo "Fix done:"
+        grep Authorization /opt/airflow/dags/airflow_lineage_operator.py
+    volumes:
+      - ingestion-volume-dags:/opt/airflow/dags
+
+    networks:
+      - internal_net
+
+
+
+networks:
+  internal_net:

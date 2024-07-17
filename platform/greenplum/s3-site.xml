@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <property>
+        <name>fs.s3a.endpoint</name>
+        <value>storage.yandexcloud.net</value>
+    </property>
+    <property>
+        <name>fs.s3a.access.key</name>
+        <value>YCAJEPqzXFXp_N_x65_9pJSOL</value>
+    </property>
+    <property>
+        <name>fs.s3a.secret.key</name>
+        <value>YCOAsGin5KPXP5EEfLvZmjy_DjBkykCe5TGBtnax</value>
+    </property>
+    <property>
+        <name>fs.s3a.fast.upload</name>
+        <value>true</value>
+    </property>
+    <property>
+        <name>fs.s3a.path.style.access</name>
+        <value>true</value>
+    </property>
+</configuration>
